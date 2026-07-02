@@ -1,6 +1,9 @@
 /* Extensoes seguras para a base limpa do JANELA-TESTE.
    Este arquivo acrescenta blocos de KPIs sem alterar a leitura original. */
 (function () {
+  let projectionSheetData = null;
+  let drinkSheetRows = [];
+
   function injectStyle() {
     if ($("extendedStyles")) return;
     const style = document.createElement("style");
@@ -18,6 +21,118 @@
       @media(max-width:720px){.insight-grid{gap:12px}.table-card.compact .table-wrap{max-height:390px}}
     `;
     document.head.append(style);
+  }
+
+  function compactName(value) {
+    return norm(value).replace(/\s+/g, "");
+  }
+
+  function sheetRows(workbook, matchers) {
+    const sheet = workbook.SheetNames.find(name => {
+      const compact = compactName(name);
+      const loose = norm(name);
+      return matchers.some(matcher => matcher(compact, loose));
+    });
+    return sheet ? XLSX.utils.sheet_to_json(workbook.Sheets[sheet], { header: 1, defval: "" }) : [];
+  }
+
+  function patchWorkbookParser() {
+    if (typeof parseWorkbook !== "function" || parseWorkbook.__extended) return;
+    const originalParseWorkbook = parseWorkbook;
+    parseWorkbook = function (workbook) {
+      originalParseWorkbook(workbook);
+      projectionSheetData = parseProjectionSheet(workbook);
+      drinkSheetRows = parseDrinkSheet(workbook);
+    };
+    parseWorkbook.__extended = true;
+  }
+
+  function parseProjectionSheet(workbook) {
+    const raw = sheetRows(workbook, [
+      compact => compact.includes("projecao") || compact.includes("projeao") || compact.includes("projeto")
+    ]);
+    if (!raw.length) return null;
+
+    const sheetMonth = text(raw[0]?.[10]) || sortMonths([...new Set(allData.map(row => row.mes).filter(Boolean))]).at(-1) || "";
+    const history = [];
+    let q1 = 0;
+    let q2 = 0;
+    let current = 0;
+
+    for (let index = 3; index < raw.length; index++) {
+      const row = raw[index] || [];
+      const mes = text(row[1]);
+      if (!mes) continue;
+      const first = num(row[2]);
+      const second = num(row[5]);
+      const total = num(row[7]);
+      if (sheetMonth && norm(mes) === norm(sheetMonth)) {
+        q1 = first;
+        q2 = second;
+        current = total || first + second;
+        continue;
+      }
+      if (total > 0 && first > 0) history.push({ mes, first, total, factor: total / first });
+    }
+
+    if (!current && sheetMonth) {
+      const rows = allData.filter(row => norm(row.mes) === norm(sheetMonth));
+      current = rows.reduce((acc, row) => acc + row.liquido, 0);
+      q1 = q1 || rows.filter(row => quinzena(row) === 1).reduce((acc, row) => acc + row.liquido, 0);
+      q2 = q2 || rows.filter(row => quinzena(row) === 2).reduce((acc, row) => acc + row.liquido, 0);
+    }
+
+    if (!history.length) return null;
+    const factors = history.map(row => row.factor);
+    const minFactor = Math.min(...factors);
+    const maxFactor = Math.max(...factors);
+    const avgFactor = factors.reduce((acc, value) => acc + value, 0) / factors.length;
+    const base = q1 || current;
+    return {
+      mes: sheetMonth,
+      q1,
+      q2,
+      current,
+      min: base * minFactor,
+      avg: base * avgFactor,
+      max: base * maxFactor,
+      minFactor,
+      avgFactor,
+      maxFactor,
+      samples: history.length,
+      source: "aba Projecao"
+    };
+  }
+
+  function parseDrinkSheet(workbook) {
+    const raw = sheetRows(workbook, [
+      compact => compact.includes("analisedrink") || compact.includes("anlisedrink")
+    ]);
+    if (!raw.length) return [];
+
+    const rows = [];
+    for (let index = 5; index < raw.length; index++) {
+      const row = raw[index] || [];
+      const mes = text(row[1] || row[27]);
+      if (!mes) continue;
+      const item = {
+        mes,
+        ano: yearFromMes(mes),
+        drinksTotal: num(row[7]),
+        especiaisTotal: num(row[13]),
+        semAlcoolTotal: num(row[19]),
+        doubleTotal: num(row[25]),
+        faturamento: num(row[28]),
+        drinkTotal: num(row[29]),
+        participacao: asPctValue(num(row[30]))
+      };
+      if (!item.drinkTotal) {
+        item.drinkTotal = item.drinksTotal + item.especiaisTotal + item.semAlcoolTotal + item.doubleTotal;
+      }
+      if (!item.participacao && item.faturamento) item.participacao = item.drinkTotal / item.faturamento;
+      if (item.drinkTotal || item.faturamento) rows.push(item);
+    }
+    return rows;
   }
 
   function ensureExtendedLayout() {
@@ -204,7 +319,7 @@
 
   function renderProjection() {
     if (!$("projectionGrid") || !$("projectionDetail")) return;
-    const p = buildProjection();
+    const p = projectionSheetData || buildProjection();
     if (!p) {
       $("projectionGrid").innerHTML = '<div class="hint">Sem dados suficientes para projecao.</div>';
       $("projectionDetail").innerHTML = "";
@@ -212,7 +327,7 @@
     }
     const progress = p.avg > 0 ? p.current / p.avg : 0;
     $("projectionGrid").innerHTML =
-      mini("Mes em projecao", p.mes, "periodo usado como referencia") +
+      mini("Mes em projecao", p.mes, p.source || "periodo usado como referencia") +
       mini("1a quinzena", shortMoney(p.q1), "base da estimativa") +
       mini("2a quinzena", shortMoney(p.q2), p.q2 > 0 ? "valor ja realizado" : "ainda sem valor") +
       mini("Acumulado real", shortMoney(p.current), fmtPct(progress) + " da projecao media", progress >= 1 ? "pos" : "") +
@@ -253,6 +368,13 @@
 
   function renderDrinkDashboard() {
     if (!$("drinkGrid") || !$("drinkTable")) return;
+    const filters = currentFilters();
+    const hasOperationalFilter = filters.grupo || filters.tipo || filters.pgto || filters.semana || filters.dia || filters.produto;
+    const sheetRows = !hasOperationalFilter ? filteredDrinkSheetRows() : [];
+    if (sheetRows.length) {
+      renderDrinkFromSheet(sheetRows);
+      return;
+    }
     const data = drinkSummary(filteredData);
     const cards = [...data.categories.entries()].map(([label, item]) =>
       mini(label, shortMoney(item.value), nb(item.qty) + " unidades", item.value ? "" : "neg")
@@ -274,6 +396,51 @@
         <td class="num">${money(val("Double drinks"))}</td>
         <td class="num subtle-total"><strong>${money(monthData.drinkTotal)}</strong></td>
         <td class="num"><strong>${fmtPct(monthData.mix)}</strong></td>
+      </tr>`;
+    });
+    $("drinkTable").innerHTML = html + "</tbody>";
+  }
+
+  function filteredDrinkSheetRows() {
+    const filters = currentFilters();
+    return drinkSheetRows.filter(row => {
+      if (filters.ano && row.ano !== filters.ano) return false;
+      if (filters.mes && row.mes !== filters.mes) return false;
+      return true;
+    });
+  }
+
+  function renderDrinkFromSheet(rows) {
+    const totals = rows.reduce((acc, row) => {
+      acc.drinks += row.drinksTotal;
+      acc.especiais += row.especiaisTotal;
+      acc.semAlcool += row.semAlcoolTotal;
+      acc.double += row.doubleTotal;
+      acc.faturamento += row.faturamento;
+      acc.drinkTotal += row.drinkTotal;
+      return acc;
+    }, { drinks: 0, especiais: 0, semAlcool: 0, double: 0, faturamento: 0, drinkTotal: 0 });
+    const mix = totals.faturamento ? totals.drinkTotal / totals.faturamento : 0;
+    $("drinkGrid").innerHTML =
+      mini("Drinks", shortMoney(totals.drinks), "aba Analise Drink") +
+      mini("Drinks especiais", shortMoney(totals.especiais), "aba Analise Drink") +
+      mini("Sem alcool", shortMoney(totals.semAlcool), "aba Analise Drink") +
+      mini("Double drinks", shortMoney(totals.double), "aba Analise Drink") +
+      mini("Total drinks", shortMoney(totals.drinkTotal), "soma das categorias", "pos") +
+      mini("Participacao", fmtPct(mix), "drinks / faturamento", mix >= .2 ? "pos" : "");
+
+    let html = '<thead><tr><th>Mes</th><th class="num">Drinks</th><th class="num">Especiais</th><th class="num">Sem alcool</th><th class="num">Double</th><th class="num">Total drinks</th><th class="num">% Fat.</th></tr></thead><tbody>';
+    sortMonths(rows.map(row => row.mes)).forEach(month => {
+      const row = rows.find(item => item.mes === month);
+      if (!row) return;
+      html += `<tr>
+        <td><strong>${row.mes}</strong></td>
+        <td class="num">${money(row.drinksTotal)}</td>
+        <td class="num">${money(row.especiaisTotal)}</td>
+        <td class="num">${money(row.semAlcoolTotal)}</td>
+        <td class="num">${money(row.doubleTotal)}</td>
+        <td class="num subtle-total"><strong>${money(row.drinkTotal)}</strong></td>
+        <td class="num"><strong>${fmtPct(row.participacao)}</strong></td>
       </tr>`;
     });
     $("drinkTable").innerHTML = html + "</tbody>";
@@ -336,6 +503,8 @@
     $("costEvolutionTable").innerHTML = evolutionTable(rows, costMetrics);
     $("performanceEvolutionTable").innerHTML = evolutionTable(rows, performanceMetrics);
   }
+
+  patchWorkbookParser();
 
   renderAll = function () {
     const summary = summarize(filteredData);
